@@ -37,6 +37,11 @@ func newVirtualScope(predecessor Injector, invokerChain []string) *virtualScope 
 type virtualScope struct {
 	self         Injector
 	invokerChain []string
+
+	// guarded 为 true 时，表示当前解析链路已经持有根作用域的“重载门禁”
+	// （读锁或重载写锁），链路中的嵌套 Invoke 不得再次加锁，否则在重载
+	// 提交等待期间可能发生同 goroutine 递归 RLock 自锁。
+	guarded bool
 }
 
 // pass through

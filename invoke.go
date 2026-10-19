@@ -23,6 +23,34 @@ import (
 // This function is used internally by the DI container for service resolution and
 // supports virtual scopes for dependency tracking and circular dependency detection.
 func invokeAnyByName(i Injector, name string) (any, error) {
+	return invokeAnyByNameGuarded(i, name, false)
+}
+
+// resolutionAlreadyGuarded 判断本次解析是否已经运行在重载门禁之内：
+// 调用方显式声明、虚拟作用域从外层继承，或注入器本身就是重载 configure
+// 使用的暂存注入器（与其内的试构造同处一个写锁上下文）。
+// 命中时不得再次申请读锁，否则会与等待中的重载写锁形成自锁。
+func resolutionAlreadyGuarded(injector Injector, guarded bool) bool {
+	if guarded {
+		return true
+	}
+
+	if v, ok := injector.(*virtualScope); ok && v.guarded {
+		return true
+	}
+
+	if _, ok := injector.(*reloadStagingInjector); ok {
+		return true
+	}
+
+	return false
+}
+
+// invokeAnyByNameGuarded 与 invokeAnyByName 相同，但允许调用方声明当前依赖解析
+// 已经持有重载门禁（guarded=true，例如 InvokeStruct 批量注入字段、Reload 期间
+// 试构造新服务）。一次完整的依赖解析（含其全部嵌套依赖）自始至终只读取同一轮
+// 注册配置，不会与重载提交交错而混用两轮配置。
+func invokeAnyByNameGuarded(i Injector, name string, guarded bool) (any, error) {
 	var invokerChain []string
 
 	injector := getInjectorOrDefault(i)
@@ -34,6 +62,15 @@ func invokeAnyByName(i Injector, name string) (any, error) {
 		if err := vScope.detectCircularDependency(name); err != nil {
 			return nil, err
 		}
+	}
+	guarded = resolutionAlreadyGuarded(injector, guarded)
+
+	// 顶层解析持有读锁：重载提交（写锁）必须等待所有在途解析结束，
+	// 从而保证解析过程中看到的 services 映射不会被整批替换。
+	if !guarded {
+		root := injector.RootScope()
+		root.resolutionMu.RLock()
+		defer root.resolutionMu.RUnlock()
 	}
 
 	invokerChain = append(invokerChain, name)
@@ -53,7 +90,9 @@ func invokeAnyByName(i Injector, name string) (any, error) {
 	}
 
 	injector.RootScope().opts.onBeforeInvocation(serviceScope, name)
-	instance, err := service.getInstanceAny(newVirtualScope(serviceScope, invokerChain))
+	nextScope := newVirtualScope(serviceScope, invokerChain)
+	nextScope.guarded = true // 后续嵌套解析复用本次门禁，不再重复加读锁
+	instance, err := service.getInstanceAny(nextScope)
 	injector.RootScope().opts.onAfterInvocation(serviceScope, name, err)
 	if err != nil {
 		return nil, err
@@ -79,6 +118,12 @@ func invokeAnyByName(i Injector, name string) (any, error) {
 // This function is used internally by the DI container for type-safe service resolution.
 // It ensures that the returned service matches the expected type T.
 func invokeByName[T any](i Injector, name string) (T, error) {
+	return invokeByNameGuarded[T](i, name, false)
+}
+
+// invokeByNameGuarded 是 invokeByName 的带门禁版本，guarded 的含义与
+// invokeAnyByNameGuarded 相同，用于让整条嵌套解析链路共享同一轮配置视图。
+func invokeByNameGuarded[T any](i Injector, name string, guarded bool) (T, error) {
 	var invokerChain []string
 
 	injector := getInjectorOrDefault(i)
@@ -90,6 +135,13 @@ func invokeByName[T any](i Injector, name string) (T, error) {
 		if err := vScope.detectCircularDependency(name); err != nil {
 			return empty[T](), err
 		}
+	}
+	guarded = resolutionAlreadyGuarded(injector, guarded)
+
+	if !guarded {
+		root := injector.RootScope()
+		root.resolutionMu.RLock()
+		defer root.resolutionMu.RUnlock()
 	}
 
 	invokerChain = append(invokerChain, name)
@@ -109,7 +161,9 @@ func invokeByName[T any](i Injector, name string) (T, error) {
 	}
 
 	injector.RootScope().opts.onBeforeInvocation(serviceScope, name)
-	instance, err := service.getInstance(newVirtualScope(serviceScope, invokerChain))
+	nextScope := newVirtualScope(serviceScope, invokerChain)
+	nextScope.guarded = true
+	instance, err := service.getInstance(nextScope)
 	injector.RootScope().opts.onAfterInvocation(serviceScope, name, err)
 
 	if err != nil {
@@ -135,6 +189,11 @@ func invokeByName[T any](i Injector, name string) (T, error) {
 // @TODO: Selection is nondeterministic when multiple services satisfy T; consider deterministic ordering
 // or explicit disambiguation to avoid surprising picks.
 func invokeByGenericType[T any](i Injector) (T, error) {
+	return invokeByGenericTypeGuarded[T](i, false)
+}
+
+// invokeByGenericTypeGuarded 是 invokeByGenericType 的带门禁版本。
+func invokeByGenericTypeGuarded[T any](i Injector, guarded bool) (T, error) {
 	injector := getInjectorOrDefault(i)
 	serviceAliasName := inferServiceName[T]()
 
@@ -143,6 +202,13 @@ func invokeByGenericType[T any](i Injector) (T, error) {
 	vScope, isVirtualScope := injector.(*virtualScope)
 	if isVirtualScope {
 		invokerChain = vScope.invokerChain
+	}
+	guarded = resolutionAlreadyGuarded(injector, guarded)
+
+	if !guarded {
+		root := injector.RootScope()
+		root.resolutionMu.RLock()
+		defer root.resolutionMu.RUnlock()
 	}
 
 	var serviceInstance any
@@ -175,8 +241,10 @@ func invokeByGenericType[T any](i Injector) (T, error) {
 	}
 
 	injector.RootScope().opts.onBeforeInvocation(serviceScope, serviceAliasName)
+	nextScope := newVirtualScope(serviceScope, append(invokerChain, serviceRealName))
+	nextScope.guarded = true
 	instance, err := serviceInstance.(serviceWrapperGetInstanceAny).getInstanceAny( //nolint:errcheck,forcetypeassert
-		newVirtualScope(serviceScope, append(invokerChain, serviceRealName)),
+		nextScope,
 	)
 	injector.RootScope().opts.onAfterInvocation(serviceScope, serviceAliasName, err)
 
@@ -219,6 +287,12 @@ func invokeByGenericType[T any](i Injector) (T, error) {
 func invokeByTags(i Injector, structName string, structValue reflect.Value, implicitAliasing bool) error { //nolint:gocyclo
 	injector := getInjectorOrDefault(i)
 
+	// 整个结构体注入视为一次完整解析：所有字段都必须来自同一轮配置，
+	// 不能在字段注入过程中混入重载前后两轮服务。字段解析复用本门禁。
+	root := injector.RootScope()
+	root.resolutionMu.RLock()
+	defer root.resolutionMu.RUnlock()
+
 	// Ensure that servicePtr is a pointer to a struct
 	if structValue.Kind() != reflect.Pointer || structValue.Elem().Kind() != reflect.Struct {
 		return fmt.Errorf("DI: must be a pointer to a struct")
@@ -254,7 +328,7 @@ func invokeByTags(i Injector, structName string, structValue reflect.Value, impl
 			serviceName = typetostring.GetReflectValueType(fieldValue)
 		}
 
-		dependency, err := invokeAnyByName(injector, serviceName)
+		dependency, err := invokeAnyByNameGuarded(injector, serviceName, true)
 		// @TODO: This fallback may pick an arbitrary matching service; selection order is not stable.
 		if err != nil && implicitAliasing && wasTagNameEmpty && errors.Is(err, ErrServiceNotFound) {
 			// Fallback: try to resolve by generic type of the field
@@ -275,7 +349,7 @@ func invokeByTags(i Injector, structName string, structValue reflect.Value, impl
 			})
 
 			if found {
-				dependency, err = invokeAnyByName(injector, resolvedName)
+				dependency, err = invokeAnyByNameGuarded(injector, resolvedName, true)
 			}
 		}
 		if err != nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 )
 
@@ -125,6 +126,18 @@ type RootScope struct {
 	opts            *InjectorOpts   // Configuration options
 	dag             *DAG            // Dependency graph for service relationships
 	healthCheckPool *jobPool[error] // Pool for parallel health check operations
+
+	// lifecycleMu 串行化会整体改写容器状态的操作：ReloadWithContext、
+	// ShutdownWithContext 与 CloneWithOpts 互斥执行，避免克隆/关停与重载
+	// 交错看到半成品状态。
+	lifecycleMu sync.Mutex
+
+	// resolutionMu 是“重载门禁”：
+	//   - 每次完整的依赖解析（Invoke 及其嵌套依赖）持有读锁；
+	//   - 重载在配置暂存完成后的安装、试构造、健康检查与提交阶段持有写锁。
+	// 写锁等待所有在途解析结束后才生效，保证一次依赖解析全程只读取同一轮
+	// 配置，不会混用重载前后两轮服务。
+	resolutionMu sync.RWMutex
 }
 
 // Pass-through methods that delegate to the underlying scope
@@ -173,7 +186,12 @@ func (s *RootScope) Shutdown() *ShutdownReport { return s.ShutdownWithContext(co
 
 // ShutdownWithContext gracefully shuts down the root scope and all its descendant scopes with context support.
 // This method ensures proper cleanup of the health check pool and all registered services.
+//
+// 关停与重载互斥：若有 ReloadWithContext 正在进行，会等待其结束，反之亦然。
 func (s *RootScope) ShutdownWithContext(ctx context.Context) *ShutdownReport {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	defer func() {
 		if s.healthCheckPool != nil {
 			s.healthCheckPool.stop()
@@ -181,7 +199,7 @@ func (s *RootScope) ShutdownWithContext(ctx context.Context) *ShutdownReport {
 		}
 	}()
 
-	return s.self.ShutdownWithContext(ctx)
+	return s.self.shutdownWithContextInternal(ctx)
 }
 
 func (s *RootScope) clone(root *RootScope, parent *Scope) *Scope { return s.self.clone(root, parent) }
@@ -304,7 +322,12 @@ func (s *RootScope) Clone() *RootScope {
 // CloneWithOpts clones injector with provided services but not with invoked instances, with options.
 //
 // Play: https://go.dev/play/p/fT-v63fbFk5
+//
+// 克隆与重载互斥，快照中的注册不会横跨两轮重载配置。
 func (s *RootScope) CloneWithOpts(opts *InjectorOpts) *RootScope {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	clone := NewWithOpts(opts)
 	clone.self = s.clone(clone, nil)
 

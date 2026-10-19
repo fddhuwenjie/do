@@ -366,7 +366,19 @@ func (s *Scope) Shutdown() *ShutdownReport {
 // Returns a ShutdownReport containing any errors and timings that occurred during shutdown.
 //
 // Play: https://go.dev/play/p/nkiBBYow2d5
+//
+// 任意作用域的关停都与根作用域重载互斥（共享根作用域 lifecycleMu），
+// 避免关停过程中服务映射被整批替换。
 func (s *Scope) ShutdownWithContext(ctx context.Context) *ShutdownReport {
+	s.rootScope.lifecycleMu.Lock()
+	defer s.rootScope.lifecycleMu.Unlock()
+
+	return s.shutdownWithContextInternal(ctx)
+}
+
+// shutdownWithContextInternal 是真正的关停实现。它假设调用方已经持有
+// 根作用域 lifecycleMu（根关停递归到子作用域时不得重复加锁）。
+func (s *Scope) shutdownWithContextInternal(ctx context.Context) *ShutdownReport {
 	s.logf("requested shutdown")
 	start := time.Now()
 
@@ -405,7 +417,8 @@ func (s *Scope) shutdownChildrenInParallel(ctx context.Context) *ShutdownReport 
 		wg.Add(1)
 
 		go func(c *Scope, i int) {
-			reports[i] = c.ShutdownWithContext(ctx)
+			// 父作用域关停已持有 lifecycleMu，递归关停子作用域时走内部路径。
+			reports[i] = c.shutdownWithContextInternal(ctx)
 			wg.Done()
 		}(child, index)
 	}
@@ -657,6 +670,42 @@ func (s *Scope) serviceSet(name string, service any) {
 	s.mu.Unlock()
 
 	s.RootScope().opts.onAfterRegistration(s, name)
+}
+
+// serviceUnset 直接从当前作用域删除一个注册项，不触发任何注册/关停钩子。
+// 仅供 ReloadWithContext 回滚“重载前不存在、本次新增”的注册时使用。
+func (s *Scope) serviceUnset(name string) {
+	s.mu.Lock()
+	delete(s.services, name)
+	s.mu.Unlock()
+}
+
+// invokedServiceNamesSnapshot 返回当前作用域已经被调用（实例化）过的服务名集合。
+// 重载试构造前后对比该集合，可以在回滚时恢复 ListInvokedServices 的观测结果。
+func (s *Scope) invokedServiceNamesSnapshot() map[string]struct{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	names := make(map[string]struct{}, len(s.orderedInvocation))
+	for name := range s.orderedInvocation {
+		names[name] = struct{}{}
+	}
+
+	return names
+}
+
+// removeInvokedServiceNames 从调用记录中删除给定名称集合（不影响 DAG 与注册）。
+func (s *Scope) removeInvokedServiceNames(names map[string]struct{}) {
+	if len(names) == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for name := range names {
+		delete(s.orderedInvocation, name)
+	}
 }
 
 // serviceForEach iterates over all services in the current scope and calls the provided callback
